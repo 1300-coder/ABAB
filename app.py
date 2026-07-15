@@ -175,6 +175,22 @@ def merge_ingredients(existing_text: str, new_items: list) -> str:
     return ", ".join(existing)
 
 
+def friendly_error_message(e: Exception) -> str:
+    """Turn raw API errors into something actionable, especially quota issues."""
+    msg = str(e)
+    if "429" in msg or "quota" in msg.lower() or "RESOURCE_EXHAUSTED" in msg:
+        return (
+            "**Rate limit / quota reached.** This is an account issue, not a bug in the "
+            "app: your API key's project likely isn't linked to a Cloud Billing account, "
+            "so Google routes it into a zero-quota bucket. Fix: link a billing account at "
+            "[console.cloud.google.com/billing](https://console.cloud.google.com/billing), "
+            "then generate a **new** API key (old keys can stay stuck on the old quota) at "
+            "[aistudio.google.com/apikey](https://aistudio.google.com/apikey). "
+            f"\n\nRaw error: `{msg[:300]}`"
+        )
+    return f"Error: {msg}"
+
+
 # ----------------------------------------------------------------------
 # UI helpers
 # ----------------------------------------------------------------------
@@ -212,17 +228,46 @@ def render_recipe_card(recipe, conn, key_prefix):
 
 def render_photo_detector(api_key, pantry_key, widget_key):
     """Lets the user snap/upload a fridge or pantry photo; detected ingredients
-    get merged into the pantry text area identified by pantry_key."""
-    with st.expander("📷 Or add ingredients from a photo"):
-        col1, col2 = st.columns(2)
-        with col1:
-            uploaded = st.file_uploader(
-                "Upload a photo", type=["jpg", "jpeg", "png", "webp"], key=f"{widget_key}_upload"
-            )
-        with col2:
-            snapped = st.camera_input("...or take one now", key=f"{widget_key}_camera")
+    get merged into the pantry text area identified by pantry_key.
 
-        image_file = uploaded or snapped
+    The camera widget is only mounted once the user explicitly picks "Take a
+    photo" — mounting st.camera_input eagerly (e.g. inside a tab that isn't
+    currently visible) can leave it stuck initializing forever, since hidden
+    tabs in Streamlit are CSS-hidden rather than unmounted.
+    """
+    with st.expander("📷 Or add ingredients from a photo"):
+        mode = st.radio(
+            "Add a photo",
+            ["Upload a photo", "Take a photo"],
+            key=f"{widget_key}_mode",
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        image_file = None
+        if mode == "Upload a photo":
+            image_file = st.file_uploader(
+                "Upload a photo", type=["jpg", "jpeg", "png", "webp"],
+                key=f"{widget_key}_upload", label_visibility="collapsed",
+            )
+        else:
+            st.caption("Requires camera permission, and only works over HTTPS or localhost.")
+            cam_enabled_key = f"{widget_key}_camera_enabled"
+            if cam_enabled_key not in st.session_state:
+                st.session_state[cam_enabled_key] = False
+
+            if not st.session_state[cam_enabled_key]:
+                if st.button("📷 Enable camera", key=f"{widget_key}_enable_cam"):
+                    st.session_state[cam_enabled_key] = True
+                    st.rerun()
+            else:
+                image_file = st.camera_input(
+                    "Take a photo", key=f"{widget_key}_camera", label_visibility="collapsed",
+                )
+                if st.button("Turn off camera", key=f"{widget_key}_disable_cam"):
+                    st.session_state[cam_enabled_key] = False
+                    st.rerun()
+
         if image_file is not None:
             st.image(image_file, width=220)
             if st.button("Detect ingredients", key=f"{widget_key}_detect"):
@@ -239,7 +284,7 @@ def render_photo_detector(api_key, pantry_key, widget_key):
                     except json.JSONDecodeError:
                         st.error("The model returned something that wasn't valid JSON. Try again.")
                     except Exception as e:
-                        st.error(f"Error: {e}")
+                        st.error(friendly_error_message(e))
 
 
 # ----------------------------------------------------------------------
@@ -323,7 +368,7 @@ with tab1:
                 except json.JSONDecodeError:
                     st.error("The model returned something that wasn't valid JSON. Try again.")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(friendly_error_message(e))
 
     if "last_recipes" in st.session_state:
         for i, recipe in enumerate(st.session_state["last_recipes"]):
@@ -372,7 +417,7 @@ with tab2:
                 except json.JSONDecodeError:
                     st.error("The model returned something that wasn't valid JSON. Try again.")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    st.error(friendly_error_message(e))
 
     if "last_plan" in st.session_state:
         day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
