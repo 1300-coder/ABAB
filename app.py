@@ -1,137 +1,206 @@
 """
-Reflection Journal — a personal companion that remembers.
+Pantry Planner — turn what's in your kitchen into recipes, a weekly meal
+plan, and a shopping list.
 
-Unlike a stateless chatbot, this app keeps a real journal: every check-in
-and mood rating is saved to a local SQLite database, so the assistant has
-continuity across days, not just within one browser tab.
+Nothing sensitive ever needs to leave your device here: the only data sent
+to the Gemini API is a list of ingredients and food preferences (e.g.
+"vegetarian", "no nuts") — no names, moods, health data, or personal
+history involved.
 """
 
+import json
+import re
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 import google.generativeai as genai
 
-# ----------------------------------------------------------------------
-# Constants
-# ----------------------------------------------------------------------
-DB_PATH = Path(__file__).parent / "journal.db"
+DB_PATH = Path(__file__).parent / "favorites.db"
 
-PERSONAS = {
-    "Warm Encourager": (
-        "You are a warm, encouraging journaling companion. You celebrate small "
-        "wins, notice progress the person might overlook, and respond with "
-        "genuine warmth. Keep responses short (3-5 sentences) and end with a "
-        "gentle, open question that invites more reflection."
-    ),
-    "Reflective Listener": (
-        "You are a calm, reflective listener for a personal journal. You mostly "
-        "mirror back what the person shares, help them notice patterns across "
-        "entries, and rarely give advice unless asked. Keep responses short "
-        "(3-5 sentences) and end with an open question."
-    ),
-    "Practical Coach": (
-        "You are a practical, grounded journaling coach. You help the person "
-        "turn reflections into one small, concrete next step. Keep responses "
-        "short (3-5 sentences), be specific and actionable, and end with a "
-        "focused question."
-    ),
-}
+DIETARY_OPTIONS = [
+    "None", "Vegetarian", "Vegan", "Gluten-free", "Dairy-free",
+    "Low-carb", "Nut-free", "Halal", "Kosher",
+]
 
-MOOD_LABELS = {
-    1: "Very low", 2: "Low", 3: "Low", 4: "A bit low", 5: "Neutral",
-    6: "Okay", 7: "Good", 8: "Good", 9: "Great", 10: "Excellent",
-}
+CUISINES = [
+    "Any", "Italian", "Mexican", "Indian", "Chinese", "Thai",
+    "Mediterranean", "American", "Japanese", "French",
+]
 
 # ----------------------------------------------------------------------
-# Database
+# Local storage for favorites (plain — nothing sensitive stored)
 # ----------------------------------------------------------------------
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entries (
+        """CREATE TABLE IF NOT EXISTS favorites (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
-            persona TEXT NOT NULL,
-            mood INTEGER NOT NULL,
-            user_text TEXT NOT NULL,
-            ai_text TEXT NOT NULL
-        )
-        """
+            title TEXT NOT NULL,
+            recipe_json TEXT NOT NULL
+        )"""
     )
     conn.commit()
     return conn
 
 
-def save_entry(conn, persona, mood, user_text, ai_text):
+def save_favorite(conn, recipe: dict):
     conn.execute(
-        "INSERT INTO entries (ts, persona, mood, user_text, ai_text) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(timespec="seconds"), persona, mood, user_text, ai_text),
+        "INSERT INTO favorites (ts, title, recipe_json) VALUES (?, ?, ?)",
+        (datetime.now().isoformat(timespec="seconds"), recipe["title"], json.dumps(recipe)),
     )
     conn.commit()
 
 
-def fetch_entries(conn, limit=None):
-    q = "SELECT ts, persona, mood, user_text, ai_text FROM entries ORDER BY ts DESC"
-    if limit:
-        q += f" LIMIT {int(limit)}"
-    return conn.execute(q).fetchall()
+def fetch_favorites(conn):
+    rows = conn.execute("SELECT id, title, recipe_json FROM favorites ORDER BY ts DESC").fetchall()
+    return [(rid, title, json.loads(rj)) for rid, title, rj in rows]
 
 
-def build_memory_context(conn, n=5):
-    """Summarize the last n entries into a short context block for the model."""
-    rows = fetch_entries(conn, limit=n)
-    if not rows:
-        return "This is the person's first entry — you have no prior history yet."
-    lines = ["Here is a brief record of the person's recent journal entries (most recent first):"]
-    for ts, _, mood, user_text, _ in rows:
-        d = ts.split("T")[0]
-        snippet = user_text.strip().replace("\n", " ")
-        if len(snippet) > 160:
-            snippet = snippet[:160] + "..."
-        lines.append(f"- {d} (mood {mood}/10): {snippet}")
-    return "\n".join(lines)
+def delete_favorite(conn, fav_id):
+    conn.execute("DELETE FROM favorites WHERE id = ?", (fav_id,))
+    conn.commit()
 
 
 # ----------------------------------------------------------------------
-# Page setup
+# Gemini helpers
 # ----------------------------------------------------------------------
-st.set_page_config(page_title="Reflection Journal", page_icon="🖋️", layout="centered")
+RECIPE_SCHEMA_INSTRUCTIONS = """
+You are a recipe assistant. Given a list of pantry ingredients and
+preferences, respond with ONLY valid JSON (no markdown fences, no
+commentary) matching this exact schema:
+
+{
+  "recipes": [
+    {
+      "title": string,
+      "description": string (one sentence),
+      "cuisine": string,
+      "prep_time_minutes": integer,
+      "servings": integer,
+      "used_ingredients": [string, ...]   // pantry items this recipe uses
+      "missing_ingredients": [string, ...] // needed items NOT in the pantry list
+      "steps": [string, ...]
+    }
+  ]
+}
+
+Rules:
+- Suggest recipes that primarily use the given pantry ingredients.
+- missing_ingredients should be short shopping-list-style items (e.g. "soy sauce", not "2 tbsp soy sauce").
+- Respect dietary restrictions strictly.
+- Return exactly the number of recipes requested.
+"""
+
+
+def extract_json(text: str) -> dict:
+    """Strip markdown fences if present and parse JSON safely."""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.MULTILINE)
+    return json.loads(cleaned)
+
+
+def generate_recipes(api_key, pantry, dietary, cuisine, count):
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        "gemini-2.0-flash",
+        system_instruction=RECIPE_SCHEMA_INSTRUCTIONS,
+        generation_config={"response_mime_type": "application/json"},
+    )
+    prefs = []
+    if dietary != "None":
+        prefs.append(f"dietary restriction: {dietary}")
+    if cuisine != "Any":
+        prefs.append(f"preferred cuisine: {cuisine}")
+    pref_text = "; ".join(prefs) if prefs else "no specific preferences"
+
+    prompt = (
+        f"Pantry ingredients: {', '.join(pantry)}.\n"
+        f"Preferences: {pref_text}.\n"
+        f"Generate exactly {count} recipe suggestions as JSON."
+    )
+    response = model.generate_content(prompt)
+    return extract_json(response.text)["recipes"]
+
+
+def generate_meal_plan(api_key, pantry, dietary, days):
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        "gemini-2.0-flash",
+        system_instruction=RECIPE_SCHEMA_INSTRUCTIONS.replace(
+            '"recipes"', '"recipes"'
+        ) + "\nGenerate one recipe per day, with good variety across the days.",
+        generation_config={"response_mime_type": "application/json"},
+    )
+    prefs = f"dietary restriction: {dietary}" if dietary != "None" else "no specific preferences"
+    prompt = (
+        f"Pantry ingredients: {', '.join(pantry)}.\n"
+        f"Preferences: {prefs}.\n"
+        f"Generate a {days}-day dinner meal plan as JSON with exactly {days} recipes, "
+        f"one per day, in the same schema."
+    )
+    response = model.generate_content(prompt)
+    return extract_json(response.text)["recipes"]
+
+
+# ----------------------------------------------------------------------
+# UI helpers
+# ----------------------------------------------------------------------
+def render_recipe_card(recipe, conn, key_prefix):
+    with st.container(border=True):
+        st.markdown(f"### {recipe['title']}")
+        st.caption(
+            f"{recipe.get('cuisine', '')} · {recipe.get('prep_time_minutes', '?')} min · "
+            f"serves {recipe.get('servings', '?')}"
+        )
+        st.write(recipe.get("description", ""))
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**✅ From your pantry**")
+            for ing in recipe.get("used_ingredients", []):
+                st.markdown(f"- {ing}")
+        with col2:
+            st.markdown("**🛒 You'll need to buy**")
+            missing = recipe.get("missing_ingredients", [])
+            if missing:
+                for ing in missing:
+                    st.markdown(f"- {ing}")
+            else:
+                st.markdown("_Nothing — you have it all!_")
+
+        with st.expander("Steps"):
+            for i, step in enumerate(recipe.get("steps", []), 1):
+                st.markdown(f"{i}. {step}")
+
+        if st.button("⭐ Save to favorites", key=f"{key_prefix}_save"):
+            save_favorite(conn, recipe)
+            st.toast(f"Saved '{recipe['title']}' to favorites!")
+
+
+# ----------------------------------------------------------------------
+# Page
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Pantry Planner", page_icon="🥗", layout="centered")
 
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;1,500&family=Inter:wght@400;500;600&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600&family=Inter:wght@400;500;600&display=swap');
     html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
-    h1, h2, h3, .journal-title { font-family: 'Lora', serif; }
-    .journal-title {
-        font-size: 2.1rem;
-        font-weight: 600;
-        color: #1E2B32;
-        margin-bottom: 0;
-    }
-    .journal-sub {
-        color: #5B6B72;
-        font-size: 0.95rem;
-        margin-top: 0.1rem;
-        margin-bottom: 1.4rem;
-    }
-    .stChatMessage { border-radius: 12px; }
+    h1, h2, h3, .app-title { font-family: 'Fraunces', serif; }
+    .app-title { font-size: 2.1rem; font-weight: 600; color: #2E2A22; margin-bottom: 0; }
+    .app-sub { color: #6B6455; font-size: 0.95rem; margin-top: 0.1rem; margin-bottom: 1.4rem; }
     </style>
-    <div class="journal-title">🖋️ Reflection Journal</div>
-    <div class="journal-sub">A private space that remembers what you tell it.</div>
+    <div class="app-title">🥗 Pantry Planner</div>
+    <div class="app-sub">Turn what's already in your kitchen into dinner.</div>
     """,
     unsafe_allow_html=True,
 )
 
 conn = get_conn()
 
-# ----------------------------------------------------------------------
-# Sidebar: API key, persona, mood, history, export
-# ----------------------------------------------------------------------
 api_key = st.secrets.get("GOOGLE_API_KEY", None) if hasattr(st, "secrets") else None
 
 with st.sidebar:
@@ -141,130 +210,112 @@ with st.sidebar:
     else:
         st.success("API key loaded from secrets.toml")
 
-    persona = st.selectbox("Companion style", list(PERSONAS.keys()))
+    dietary = st.selectbox("Dietary preference", DIETARY_OPTIONS)
+    cuisine = st.selectbox("Cuisine", CUISINES)
 
     st.divider()
-    st.subheader("Today's check-in")
-    mood = st.slider("How are you feeling right now?", 1, 10, 5)
-    st.caption(f"**{MOOD_LABELS[mood]}**")
-
-    st.divider()
-    st.subheader("Mood trend")
-    rows = fetch_entries(conn, limit=30)
-    if rows:
-        df = pd.DataFrame(rows, columns=["ts", "persona", "mood", "user_text", "ai_text"])
-        df["ts"] = pd.to_datetime(df["ts"])
-        df = df.sort_values("ts")
-        st.line_chart(df.set_index("ts")["mood"], height=160)
-    else:
-        st.caption("Your mood trend will appear here after your first entry.")
-
-    st.divider()
-    with st.expander("📖 Past entries"):
-        all_rows = fetch_entries(conn, limit=50)
-        if not all_rows:
-            st.caption("No entries yet.")
-        for ts, p, m, user_text, ai_text in all_rows:
-            d = ts.replace("T", " ")
-            st.markdown(f"**{d}** · mood {m}/10 · _{p}_")
-            st.markdown(f"> {user_text}")
-            st.caption(ai_text)
-            st.markdown("---")
-
-    if rows:
-        export_lines = ["# My Reflection Journal\n"]
-        for ts, p, m, user_text, ai_text in reversed(fetch_entries(conn)):
-            export_lines.append(f"## {ts.replace('T', ' ')} (mood {m}/10, {p})\n")
-            export_lines.append(f"**Me:** {user_text}\n")
-            export_lines.append(f"**Companion:** {ai_text}\n")
-        st.download_button(
-            "⬇️ Export journal (.md)",
-            "\n".join(export_lines),
-            file_name=f"journal_export_{date.today().isoformat()}.md",
-            mime="text/markdown",
-        )
-
-    st.divider()
-    st.caption(
-        "This is a private reflection tool, not a substitute for professional "
-        "mental health care. If you're in crisis, please reach out to a "
-        "counselor, doctor, or local crisis line."
-    )
+    st.subheader("⭐ Favorites")
+    favs = fetch_favorites(conn)
+    if not favs:
+        st.caption("No saved recipes yet.")
+    for fid, title, recipe in favs:
+        c1, c2 = st.columns([4, 1])
+        c1.markdown(f"**{title}**")
+        if c2.button("✕", key=f"del_{fid}"):
+            delete_favorite(conn, fid)
+            st.rerun()
 
 if not api_key:
-    st.info("Enter your Gemini API key in the sidebar to begin.")
+    st.info("Enter your Gemini API key in the sidebar to get recipe suggestions.")
     st.stop()
 
-# ----------------------------------------------------------------------
-# Configure Gemini
-# ----------------------------------------------------------------------
-try:
-    genai.configure(api_key=api_key)
-except Exception as e:
-    st.error(f"Failed to configure Gemini: {e}")
-    st.stop()
-
-memory_context = build_memory_context(conn, n=5)
-system_instruction = PERSONAS[persona] + "\n\n" + memory_context
-
-# Re-create the chat session whenever the persona changes, so the system
-# instruction (and injected memory) stays accurate.
-if (
-    "chat_session" not in st.session_state
-    or st.session_state.get("persona_used") != persona
-):
-    try:
-        model = genai.GenerativeModel(
-            "gemini-2.0-flash", system_instruction=system_instruction
-        )
-        st.session_state.chat_session = model.start_chat(history=[])
-        st.session_state.persona_used = persona
-        st.session_state.messages = []
-    except Exception as e:
-        st.error(f"Failed to start chat session: {e}")
-        st.stop()
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+tab1, tab2 = st.tabs(["🍳 Recipes from pantry", "📅 Weekly meal plan"])
 
 # ----------------------------------------------------------------------
-# Render chat history (this session only — full history lives in sidebar)
+# Tab 1: quick recipes from a pantry list
 # ----------------------------------------------------------------------
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+with tab1:
+    pantry_text = st.text_area(
+        "What's in your pantry / fridge?",
+        placeholder="e.g. chicken thighs, rice, onion, garlic, soy sauce, bell peppers",
+        height=100,
+    )
+    count = st.slider("Number of recipe ideas", 1, 6, 3)
 
-# ----------------------------------------------------------------------
-# Chat input
-# ----------------------------------------------------------------------
-placeholder_text = "What's on your mind today?"
-user_prompt = st.chat_input(placeholder_text)
+    if st.button("🔍 Find recipes", type="primary"):
+        pantry = [p.strip() for p in pantry_text.split(",") if p.strip()]
+        if not pantry:
+            st.warning("Add at least one ingredient first.")
+        else:
+            with st.spinner("Thinking up some recipes..."):
+                try:
+                    recipes = generate_recipes(api_key, pantry, dietary, cuisine, count)
+                    st.session_state["last_recipes"] = recipes
+                except json.JSONDecodeError:
+                    st.error("The model returned something that wasn't valid JSON. Try again.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
-if user_prompt:
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
+    if "last_recipes" in st.session_state:
+        for i, recipe in enumerate(st.session_state["last_recipes"]):
+            render_recipe_card(recipe, conn, key_prefix=f"recipe_{i}")
 
-    with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        full_response = ""
-        try:
-            response = st.session_state.chat_session.send_message(
-                user_prompt, stream=True
+        all_missing = sorted({
+            ing for r in st.session_state["last_recipes"] for ing in r.get("missing_ingredients", [])
+        })
+        if all_missing:
+            st.divider()
+            st.subheader("🛒 Combined shopping list")
+            for ing in all_missing:
+                st.markdown(f"- {ing}")
+            st.download_button(
+                "⬇️ Download shopping list (.txt)",
+                "\n".join(all_missing),
+                file_name="shopping_list.txt",
             )
-            for chunk in response:
-                if chunk.text:
-                    full_response += chunk.text
-                    response_placeholder.markdown(full_response + "▌")
-            response_placeholder.markdown(full_response)
-        except Exception as e:
-            full_response = f"⚠️ Error: {e}"
-            response_placeholder.markdown(full_response)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+# ----------------------------------------------------------------------
+# Tab 2: weekly meal plan
+# ----------------------------------------------------------------------
+with tab2:
+    pantry_text2 = st.text_area(
+        "What's in your pantry / fridge?",
+        placeholder="e.g. eggs, spinach, pasta, canned tomatoes, cheese, potatoes",
+        height=100,
+        key="pantry2",
+    )
+    days = st.slider("How many days?", 3, 7, 5)
 
-    # Persist to the journal database
-    try:
-        save_entry(conn, persona, mood, user_prompt, full_response)
-    except Exception as e:
-        st.warning(f"Couldn't save this entry to your journal: {e}")
+    if st.button("📅 Plan my week", type="primary"):
+        pantry2 = [p.strip() for p in pantry_text2.split(",") if p.strip()]
+        if not pantry2:
+            st.warning("Add at least one ingredient first.")
+        else:
+            with st.spinner("Planning your week..."):
+                try:
+                    plan = generate_meal_plan(api_key, pantry2, dietary, days)
+                    st.session_state["last_plan"] = plan
+                except json.JSONDecodeError:
+                    st.error("The model returned something that wasn't valid JSON. Try again.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    if "last_plan" in st.session_state:
+        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        for i, recipe in enumerate(st.session_state["last_plan"]):
+            st.markdown(f"#### {day_names[i] if i < len(day_names) else f'Day {i+1}'}")
+            render_recipe_card(recipe, conn, key_prefix=f"plan_{i}")
+
+        all_missing2 = sorted({
+            ing for r in st.session_state["last_plan"] for ing in r.get("missing_ingredients", [])
+        })
+        if all_missing2:
+            st.divider()
+            st.subheader("🛒 Week's shopping list")
+            for ing in all_missing2:
+                st.markdown(f"- {ing}")
+            st.download_button(
+                "⬇️ Download shopping list (.txt)",
+                "\n".join(all_missing2),
+                file_name="weekly_shopping_list.txt",
+            )
