@@ -8,6 +8,7 @@ to the Gemini API is a list of ingredients and food preferences (e.g.
 history involved.
 """
 
+import io
 import json
 import re
 import sqlite3
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import streamlit as st
 import google.generativeai as genai
+from PIL import Image
 
 DB_PATH = Path(__file__).parent / "favorites.db"
 
@@ -144,6 +146,35 @@ def generate_meal_plan(api_key, pantry, dietary, days):
     return extract_json(response.text)["recipes"]
 
 
+def detect_ingredients_from_image(api_key, image_bytes):
+    """Send a photo to Gemini's vision model and get back a plain ingredient list."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        "gemini-2.0-flash",
+        generation_config={"response_mime_type": "application/json"},
+    )
+    img = Image.open(io.BytesIO(image_bytes))
+    prompt = (
+        "Look at this photo of a fridge, pantry, or countertop and identify every "
+        "distinct food ingredient you can see. Respond with ONLY valid JSON in this "
+        'exact schema: {"ingredients": [string, ...]}. Use simple everyday ingredient '
+        'names (e.g. "carrots", "milk", "eggs"), not brand names, not quantities, no duplicates.'
+    )
+    response = model.generate_content([prompt, img])
+    return extract_json(response.text)["ingredients"]
+
+
+def merge_ingredients(existing_text: str, new_items: list) -> str:
+    """Merge newly detected ingredients into the existing pantry text, deduping case-insensitively."""
+    existing = [p.strip() for p in existing_text.split(",") if p.strip()]
+    seen = {p.lower() for p in existing}
+    for item in new_items:
+        if item.strip().lower() not in seen:
+            existing.append(item.strip())
+            seen.add(item.strip().lower())
+    return ", ".join(existing)
+
+
 # ----------------------------------------------------------------------
 # UI helpers
 # ----------------------------------------------------------------------
@@ -177,6 +208,38 @@ def render_recipe_card(recipe, conn, key_prefix):
         if st.button("⭐ Save to favorites", key=f"{key_prefix}_save"):
             save_favorite(conn, recipe)
             st.toast(f"Saved '{recipe['title']}' to favorites!")
+
+
+def render_photo_detector(api_key, pantry_key, widget_key):
+    """Lets the user snap/upload a fridge or pantry photo; detected ingredients
+    get merged into the pantry text area identified by pantry_key."""
+    with st.expander("📷 Or add ingredients from a photo"):
+        col1, col2 = st.columns(2)
+        with col1:
+            uploaded = st.file_uploader(
+                "Upload a photo", type=["jpg", "jpeg", "png", "webp"], key=f"{widget_key}_upload"
+            )
+        with col2:
+            snapped = st.camera_input("...or take one now", key=f"{widget_key}_camera")
+
+        image_file = uploaded or snapped
+        if image_file is not None:
+            st.image(image_file, width=220)
+            if st.button("Detect ingredients", key=f"{widget_key}_detect"):
+                with st.spinner("Looking at your photo..."):
+                    try:
+                        found = detect_ingredients_from_image(api_key, image_file.getvalue())
+                        if found:
+                            st.session_state[pantry_key] = merge_ingredients(
+                                st.session_state.get(pantry_key, ""), found
+                            )
+                            st.success(f"Added: {', '.join(found)}")
+                        else:
+                            st.warning("Couldn't identify any ingredients in that photo — try a clearer shot.")
+                    except json.JSONDecodeError:
+                        st.error("The model returned something that wasn't valid JSON. Try again.")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -235,10 +298,16 @@ tab1, tab2 = st.tabs(["🍳 Recipes from pantry", "📅 Weekly meal plan"])
 # Tab 1: quick recipes from a pantry list
 # ----------------------------------------------------------------------
 with tab1:
+    if "pantry1" not in st.session_state:
+        st.session_state["pantry1"] = ""
+
+    render_photo_detector(api_key, pantry_key="pantry1", widget_key="tab1")
+
     pantry_text = st.text_area(
         "What's in your pantry / fridge?",
         placeholder="e.g. chicken thighs, rice, onion, garlic, soy sauce, bell peppers",
         height=100,
+        key="pantry1",
     )
     count = st.slider("Number of recipe ideas", 1, 6, 3)
 
@@ -278,6 +347,11 @@ with tab1:
 # Tab 2: weekly meal plan
 # ----------------------------------------------------------------------
 with tab2:
+    if "pantry2" not in st.session_state:
+        st.session_state["pantry2"] = ""
+
+    render_photo_detector(api_key, pantry_key="pantry2", widget_key="tab2")
+
     pantry_text2 = st.text_area(
         "What's in your pantry / fridge?",
         placeholder="e.g. eggs, spinach, pasta, canned tomatoes, cheese, potatoes",
