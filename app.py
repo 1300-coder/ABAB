@@ -129,7 +129,7 @@ def generate_recipes(api_key, pantry, dietary, cuisine, count):
 def generate_meal_plan(api_key, pantry, dietary, days):
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
-        "gemini-2.0-flash",
+        "gemini-flash-latest",
         system_instruction=RECIPE_SCHEMA_INSTRUCTIONS.replace(
             '"recipes"', '"recipes"'
         ) + "\nGenerate one recipe per day, with good variety across the days.",
