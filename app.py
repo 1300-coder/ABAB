@@ -12,6 +12,7 @@ import io
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -98,6 +99,25 @@ Rules:
 """
 
 
+def call_with_retry(fn, max_attempts=3, base_delay=2):
+    """Retry a Gemini API call on transient server errors (503 UNAVAILABLE,
+    500 INTERNAL, 429 with short retry) using exponential backoff. Re-raises
+    immediately for anything that isn't transient (e.g. bad request, auth)."""
+    transient_markers = ("503", "UNAVAILABLE", "500", "INTERNAL", "overloaded", "DEADLINE_EXCEEDED")
+    last_exception = None
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e)
+            is_transient = any(marker in msg for marker in transient_markers)
+            last_exception = e
+            if not is_transient or attempt == max_attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+    raise last_exception
+
+
 class JsonParseError(Exception):
     """Raised when the model's response couldn't be parsed as JSON — carries the raw text."""
     def __init__(self, raw_text: str):
@@ -142,14 +162,14 @@ def generate_recipes(api_key, pantry, dietary, cuisine, count):
         f"Preferences: {pref_text}.\n"
         f"Generate exactly {count} recipe suggestions as JSON."
     )
-    response = client.models.generate_content(
+    response = call_with_retry(lambda: client.models.generate_content(
         model="gemini-flash-latest",
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=RECIPE_SCHEMA_INSTRUCTIONS,
             response_mime_type="application/json",
         ),
-    )
+    ))
     return extract_json(response.text)["recipes"]
 
 
@@ -166,14 +186,14 @@ def generate_meal_plan(api_key, pantry, dietary, days):
         RECIPE_SCHEMA_INSTRUCTIONS
         + "\nGenerate one recipe per day, with good variety across the days."
     )
-    response = client.models.generate_content(
+    response = call_with_retry(lambda: client.models.generate_content(
         model="gemini-flash-latest",
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
         ),
-    )
+    ))
     return extract_json(response.text)["recipes"]
 
 
@@ -187,11 +207,11 @@ def detect_ingredients_from_image(api_key, image_bytes):
         'exact schema: {"ingredients": [string, ...]}. Use simple everyday ingredient '
         'names (e.g. "carrots", "milk", "eggs"), not brand names, not quantities, no duplicates.'
     )
-    response = client.models.generate_content(
+    response = call_with_retry(lambda: client.models.generate_content(
         model="gemini-flash-latest",
         contents=[prompt, img],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
+    ))
     return extract_json(response.text)["ingredients"]
 
 
@@ -217,6 +237,13 @@ def friendly_error_message(e: Exception) -> str:
             "[console.cloud.google.com/billing](https://console.cloud.google.com/billing), "
             "then generate a **new** API key (old keys can stay stuck on the old quota) at "
             "[aistudio.google.com/apikey](https://aistudio.google.com/apikey). "
+            f"\n\nRaw error: `{msg[:300]}`"
+        )
+    if "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower():
+        return (
+            "**Gemini's servers are temporarily overloaded.** This already retried a "
+            "few times automatically and still didn't get through — it's on Google's "
+            "side, not this app. Wait a bit and try again."
             f"\n\nRaw error: `{msg[:300]}`"
         )
     return f"Error: {msg}"
